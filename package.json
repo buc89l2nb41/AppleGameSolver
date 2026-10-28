@@ -1,0 +1,13 @@
+{
+  "name": "apple-game-solver",
+  "version": "1.0.0",
+  "description": "Automated solver for Apple Game (사과게임) using Playwright",
+  "type": "module",
+  "scripts": {
+    "solve": "node solver.js",
+    "join": "node solver.js"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  }
+}

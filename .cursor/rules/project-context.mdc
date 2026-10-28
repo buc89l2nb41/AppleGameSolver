@@ -1,0 +1,138 @@
+---
+description: Apple Game Solver 프로젝트 컨텍스트 - 새 에이전트가 반드시 읽어야 할 핵심 지식
+globs:
+  - "**/*.js"
+---
+
+# Apple Game Solver — 프로젝트 컨텍스트
+
+## 게임 정보
+- 사이트: https://apple.oshizi.com/ (Apple Game Plus, v1.4d)
+- 17×10 격자에 1~9 숫자 사과, 직사각형 드래그로 합=10이면 제거
+- 2분 제한, 최고 170점
+- Next.js + React 18 앱, **Canvas로 렌더링** (DOM 요소 아님)
+
+## 프로젝트 구조
+- `solver.js` — 메인 솔버 (Playwright + WebSocket/React 내부 호출)
+- `package.json` — playwright 의존성
+- `README.md` — 사용법
+
+## 두 가지 모드
+
+### 솔로 모드 (`node solver.js`)
+- React fiber tree에서 `onMove` 콜백을 추출하여 직접 호출
+- 보드 읽기 → 수 계산 → onMove 호출 → 반복
+
+### 방(Room) 모드 (`node solver.js <방코드> <닉네임>`)
+- Socket.IO WebSocket을 인터셉트하여 `game:action` 메시지를 직접 전송
+- 보드 읽기 → 수 계산 → WS로 전송 → 서버 응답의 보드로 갱신 → 반복
+
+## 핵심 기술 지식 (삽질로 얻은 것들)
+
+### 1. 보드 데이터 위치
+Canvas로 렌더링되므로 DOM에서 숫자를 읽을 수 없다.
+보드 데이터는 React fiber tree에서 추출:
+- **Canvas의 parent div** → `__reactProps$` → children 재귀 탐색 → `props.board`
+- 170자 문자열, 각 자리가 셀 값 (0=빈, 1~9=사과)
+- row-major: `boardStr[row * 17 + col]`
+- 멀티플레이어에서는 캔버스가 최대 6개 (메인 1 + 관전용 미니맵 + 숨김 캔버스)
+
+### 2. 움직임 실행 — 솔로 모드
+**Playwright의 mouse 이벤트(page.mouse.down/move/up)는 작동하지 않는다!**
+- 네이티브 이벤트가 Canvas에 도달하고 `isTrusted=true`이지만,
+  React의 `onMouseDown` 핸들러가 트리거되지 않음
+- CDP Input.dispatchMouseEvent도 같은 문제
+- `element.dispatchEvent(new PointerEvent(...))` 도 실패 (isTrusted=false)
+- 원인: React 18 이벤트 위임 방식 + Canvas 특수성
+
+**해결책: React의 `onMove` 콜백을 직접 호출**
+```javascript
+const parent = canvas.parentElement;
+const propsKey = Object.keys(parent).find(k => k.startsWith('__reactProps$'));
+const onMove = parent[propsKey].children[0].props.onMove;
+onMove({r1, c1, r2, c2}, newBoard, removed);
+```
+
+### 3. 움직임 실행 — 방 모드 (핵심!)
+**방 모드에서는 `onMove` prop이 존재하지 않는다!**
+멀티플레이어는 서버와 WebSocket(Socket.IO)으로 통신하는 구조.
+
+**해결책: WebSocket `game:action` 메시지 직접 전송**
+
+#### Socket.IO 프로토콜 (Engine.IO v4)
+- 메시지 형식: `42{ackId}["event_name", data]`
+  - `4` = Engine.IO message, `2` = Socket.IO event
+  - `ackId` = 0부터 증가하는 응답 추적 번호
+- 응답 형식: `43{ackId}[responseData]`
+- 핑/퐁: `2` (ping) / `3` (pong)
+
+#### 주요 이벤트
+| 방향 | 이벤트 | 데이터 |
+|------|--------|--------|
+| >>> | `room:join` | `{code, nickname, isCustomNickname, clientId}` |
+| >>> | `room:toggleReady` | (없음) |
+| <<< | `game:started` | `{seed, board}` |
+| >>> | `game:action` | `{selection: {r1, c1, r2, c2}, timestampMs}` |
+| <<< | (ack) | `{ok, score, board}` 또는 `{ok: false, error}` |
+| <<< | `game:playerScored` | `{playerId, nickname, score, board}` |
+| <<< | `game:scoreboard` | `{rankings, timeRemainingMs, boards}` |
+
+#### 구현 방식
+```javascript
+// page.addInitScript()로 WebSocket 생성자를 패치하여 인스턴스 캡쳐
+const origWS = window.WebSocket;
+window.WebSocket = function(url, protocols) {
+  const ws = new origWS(url, protocols);
+  window.__wsInstances.push(ws);
+  // send를 래핑하여 ackId 추적
+  // message 이벤트에서 game:started 감지 + ack 응답 캡쳐
+  return ws;
+};
+
+// 이후 직접 메시지 전송
+ws.send(`42${ackId}${JSON.stringify(["game:action", {
+  selection: {r1, c1, r2, c2},
+  timestampMs: Date.now() - gameStartTime
+}])}`);
+```
+
+#### 서버 응답 보드 활용 (중요!)
+서버가 `{ok: true, score, board}` 로 응답하면 새 보드 문자열을 반환한다.
+**이 보드를 다음 수 계산에 사용해야 한다** — React props의 보드는 갱신이 느림.
+
+### 4. 방 참여 UI 흐름
+1. 메인 페이지 (`/`) → `#room-code` input에 6자리 코드 입력 → "참여" 버튼
+2. 방 참여 모달 → `#nickname` input에 닉네임 → "참여하기" 버튼
+3. 대기실 → 정보 모달 "OK" 닫기 → **"Ready" 버튼 클릭** (필수!)
+4. 호스트가 "게임 시작" → Canvas 출현 + `game:started` WS 메시지
+5. 솔버가 자동 풀이 시작
+
+### 5. Canvas 좌표 (마우스 이벤트 디버깅용)
+- cellSize = 33px, padX = 55px, padY = 35px (1280×900 viewport 기준)
+- 멀티플레이어 메인 캔버스: 671×400
+- 미니맵 캔버스: 221×130 (cellSize=13)
+- 셀(col,row) 중심 = canvas좌표 (55 + col*33 + 16.5, 35 + row*33 + 16.5)
+- interactive canvas: `__reactProps$.onMouseDown` 존재 + board의 `interactive: true`
+
+### 6. 게임 상태 감지
+- fiber tree에서 `"playing"`, `"waiting"`, `"finished"`, `"ready"` 문자열 탐색
+- **솔로 모드에서는 작동하지만, 방 모드에서는 `unknown` 반환될 수 있음**
+- 방 모드에서는 WS `game:started` 메시지로 게임 시작 감지가 더 확실
+
+### 7. 알고리즘
+- 2D prefix sum으로 O(ROWS²×COLS²) 직사각형 합 탐색
+- 빈 셀(0)은 합에 영향 없음. 직사각형 안 사과(1~9)만의 합이 10이면 유효 (빈 칸 허용)
+- 탐욕적: 가장 큰 직사각형(많은 사과 제거) 우선
+- 성능: ~3.8초에 31수, 75점 달성 (MOVE_DELAY 80ms 기준)
+- 개선 여지: look-ahead 탐색, 시뮬레이션 기반 최적화, delay 축소
+
+### 8. URL 패턴
+- 솔로: `https://apple.oshizi.com/` → "혼자 하기" 클릭으로 진입
+- 방 생성: `https://apple.oshizi.com/room/create`
+- 방 참여: `https://apple.oshizi.com/room/{CODE}` (6자리 코드)
+
+### 9. 알려진 제한사항
+- 솔로 모드의 `onMove` 콜백이 React 재렌더링 후 사라질 수 있음 → bridge 재주입 필요
+- 방 모드 WS 인터셉트는 `addInitScript`로 페이지 로드 전에 설정해야 함
+- `game:action` 전에 게임이 시작되지 않았으면 `"Game is not in progress"` 에러
+- 선택이 이미 빈 셀을 포함하면 `"Invalid selection"` 에러

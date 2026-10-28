@@ -1,0 +1,9 @@
+node_modules/
+result.png
+join-fail.png
+_probe-*.mjs
+*.log
+.DS_Store
+Thumbs.db
+.env
+.env.*
